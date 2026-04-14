@@ -1,16 +1,25 @@
 import os
 import sys
 import json
-import requests
-from dotenv import load_dotenv
+import urllib.request
+import urllib.error
 
 
-# Load environment variables
-if os.path.exists("config/.env"):
-    load_dotenv("config/.env", override=True)
-else:
-    load_dotenv(override=True)
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
 
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ[key.strip()] = value.strip()
+
+
+load_env_file("config/.env")
+load_env_file(".env")
 
 OS_AUTH_URL = os.getenv("OS_AUTH_URL")
 REGION = os.getenv("OS_REGION_NAME", "eu-de-1")
@@ -31,11 +40,9 @@ for key, value in required_vars.items():
         print(f"Missing required environment variable: {key}")
         sys.exit(1)
 
-
 COMPUTE_URL = f"https://compute-3.{REGION}.cloud.sap/v2.1/{PROJECT_ID}/servers/detail"
 IMAGE_URL = f"https://image-3.{REGION}.cloud.sap/v2/images"
 
-# Approved golden image naming prefixes
 APPROVED_PREFIXES = (
     "sap-compliant-",
     "golden-",
@@ -46,7 +53,22 @@ APPROVED_PREFIXES = (
 )
 
 
-def get_token() -> str:
+def http_request(url, method="GET", headers=None, data=None, timeout=30):
+    req = urllib.request.Request(url=url, data=data, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            response_headers = dict(response.getheaders())
+            return response.getcode(), response_headers, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return e.code, dict(e.headers), body
+    except Exception as e:
+        print(f"HTTP request failed for {url}: {e}")
+        sys.exit(1)
+
+
+def get_token():
     url = f"{OS_AUTH_URL}/auth/tokens"
 
     payload = {
@@ -61,46 +83,52 @@ def get_token() -> str:
         }
     }
 
+    data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json"
     }
 
-    response = requests.post(url, json=payload, headers=headers, timeout=30)
+    status_code, response_headers, response_text = http_request(
+        url=url,
+        method="POST",
+        headers=headers,
+        data=data
+    )
 
-    print("Auth status code:", response.status_code)
-    print("Auth response headers:", dict(response.headers))
+    print("Auth status code:", status_code)
+    print("Auth response headers:", response_headers)
 
-    if response.status_code not in [200, 201]:
-        print("Authentication failed:", response.text)
+    if status_code not in (200, 201):
+        print("Authentication failed:", response_text)
         sys.exit(1)
 
     token = (
-        response.headers.get("X-Subject-Token")
-        or response.headers.get("x-subject-token")
-        or response.headers.get("X-Auth-Token")
-        or response.headers.get("x-auth-token")
+        response_headers.get("X-Subject-Token")
+        or response_headers.get("x-subject-token")
+        or response_headers.get("X-Auth-Token")
+        or response_headers.get("x-auth-token")
     )
 
     if not token:
         print("Authentication succeeded but token was not returned.")
-        print("Full response body:", response.text)
+        print("Full response body:", response_text)
         sys.exit(1)
 
     return token
 
 
-def get_all_images(headers: dict) -> dict:
+def get_all_images(headers):
     image_map = {}
     url = IMAGE_URL
 
     while url:
-        response = requests.get(url, headers=headers, timeout=30)
+        status_code, _, response_text = http_request(url=url, method="GET", headers=headers)
 
-        if response.status_code != 200:
-            print("Failed to fetch images:", response.text)
+        if status_code != 200:
+            print("Failed to fetch images:", response_text)
             sys.exit(1)
 
-        data = response.json()
+        data = json.loads(response_text)
 
         for image in data.get("images", []):
             image_id = image.get("id")
@@ -120,7 +148,7 @@ def get_all_images(headers: dict) -> dict:
     return image_map
 
 
-def is_golden_image(image_name: str) -> bool:
+def is_golden_image(image_name):
     if not image_name:
         return False
 
@@ -140,13 +168,15 @@ def check_compliance():
     image_map = get_all_images(headers)
 
     print("Fetching servers...")
-    response = requests.get(COMPUTE_URL, headers=headers, timeout=30)
+    status_code, _, response_text = http_request(url=COMPUTE_URL, method="GET", headers=headers)
 
-    if response.status_code != 200:
-        print("Failed to fetch servers:", response.text)
+    if status_code != 200:
+        print("Failed to fetch servers:", response_text)
         sys.exit(1)
 
-    servers = response.json().get("servers", [])
+    response_json = json.loads(response_text)
+    servers = response_json.get("servers", [])
+
     total_servers = len(servers)
     compliant_count = 0
     non_compliant_count = 0
@@ -160,7 +190,6 @@ def check_compliance():
 
         image_info = server.get("image") or {}
         image_id = image_info.get("id", "")
-
         image_name = image_map.get(image_id, "")
 
         if is_golden_image(image_name):
@@ -189,7 +218,7 @@ def check_compliance():
         "servers": server_list
     }
 
-    with open("golden_image_compliance.json", "w") as f:
+    with open("golden_image_compliance.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=4)
 
     print("\nJSON saved: golden_image_compliance.json")
