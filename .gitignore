@@ -1,0 +1,7 @@
+.env
+config/.env
+__pycache__/
+*.pyc
+golden_image_compliance.json
+inputs/api_result.txt
+inputs/scanner_result.txt
