@@ -1,14 +1,24 @@
 import os
 import sys
 import json
-import requests
-from dotenv import load_dotenv
+import ssl
+import urllib.request
+import urllib.error
 
-# Load environment variables
-if os.path.exists("config/.env"):
-    load_dotenv("config/.env", override=True)
-else:
-    load_dotenv(override=True)
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ[key.strip()] = value.strip()
+
+load_env_file(".env")
+load_env_file("config/.env")
 
 OS_AUTH_URL = os.getenv("OS_AUTH_URL")
 REGION = os.getenv("OS_REGION_NAME", "eu-de-1")
@@ -32,7 +42,6 @@ for key, value in required_vars.items():
 COMPUTE_URL = f"https://compute-3.{REGION}.cloud.sap/v2.1/{PROJECT_ID}/servers/detail"
 IMAGE_URL = f"https://image-3.{REGION}.cloud.sap/v2/images"
 
-# Approved golden image naming prefixes
 APPROVED_PREFIXES = (
     "sap-compliant-",
     "golden-",
@@ -42,6 +51,31 @@ APPROVED_PREFIXES = (
     "approved-",
 )
 
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+def http_request(url, method="GET", headers=None, payload=None):
+    if headers is None:
+        headers = {}
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            return response.status, dict(response.headers), body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"HTTP Error {e.code}: {body}")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"URL Error: {e}")
+        sys.exit(1)
 
 def get_token() -> str:
     url = f"{OS_AUTH_URL}/auth/tokens"
@@ -52,41 +86,45 @@ def get_token() -> str:
                 "methods": ["application_credential"],
                 "application_credential": {
                     "id": OS_APPLICATION_CREDENTIAL_ID,
-                    "secret": OS_APPLICATION_CREDENTIAL_SECRET,
-                },
+                    "secret": OS_APPLICATION_CREDENTIAL_SECRET
+                }
             }
         }
     }
 
     headers = {"Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers, timeout=30)
 
-    if response.status_code != 201:
-        print("Auth failed:", response.text)
+    status, response_headers, body = http_request(
+        url=url,
+        method="POST",
+        headers=headers,
+        payload=payload
+    )
+
+    if status != 201:
+        print("Authentication failed:", body)
         sys.exit(1)
 
-    token = response.headers.get("X-Subject-Token")
+    token = response_headers.get("X-Subject-Token")
     if not token:
         print("Authentication succeeded but token was not returned.")
         sys.exit(1)
 
     return token
 
-
 def get_all_images(headers: dict) -> dict:
-    """
-    Returns image_id -> image_name mapping
-    """
     image_map = {}
     url = IMAGE_URL
 
     while url:
-        response = requests.get(url, headers=headers, timeout=30)
-        if response.status_code != 200:
-            print("Failed to fetch images:", response.text)
-            break
+        status, _, body = http_request(url=url, method="GET", headers=headers)
 
-        data = response.json()
+        if status != 200:
+            print("Failed to fetch images")
+            sys.exit(1)
+
+        data = json.loads(body)
+
         for image in data.get("images", []):
             image_id = image.get("id")
             image_name = image.get("name", "")
@@ -98,40 +136,37 @@ def get_all_images(headers: dict) -> dict:
             if next_link.startswith("http"):
                 url = next_link
             else:
-                url = f"https://image-3.{REGION}.cloud.sap{next_link}"
+                url = f"{IMAGE_URL}{next_link}" if next_link.startswith("?") else next_link
         else:
             url = None
 
     return image_map
 
-
-def is_golden_image(image_name: str) -> bool:
+def is_approved_golden_image(image_name: str) -> bool:
     if not image_name:
         return False
-    image_name = image_name.strip().lower()
+    image_name = image_name.lower()
     return image_name.startswith(APPROVED_PREFIXES)
 
-
-def check_compliance() -> None:
+def check_compliance():
     print("Generating token...")
     token = get_token()
 
     headers = {
-        "X-Auth-Token": token,
-        "Content-Type": "application/json",
+        "X-Auth-Token": token
     }
 
     print("Fetching image catalog...")
     image_map = get_all_images(headers)
 
     print("Fetching servers...")
-    response = requests.get(COMPUTE_URL, headers=headers, timeout=30)
+    status, _, body = http_request(url=COMPUTE_URL, method="GET", headers=headers)
 
-    if response.status_code != 200:
-        print("Failed to fetch servers:", response.text)
+    if status != 200:
+        print("Failed to fetch servers")
         sys.exit(1)
 
-    servers = response.json().get("servers", [])
+    servers = json.loads(body).get("servers", [])
 
     total_servers = len(servers)
     compliant_count = 0
@@ -140,65 +175,48 @@ def check_compliance() -> None:
 
     print(f"\nTotal servers found: {total_servers}\n")
 
-    for server in servers:
-        server_name = server.get("name", "")
-        server_id = server.get("id", "")
+    for s in servers:
+        server_name = s.get("name")
+        server_id = s.get("id")
 
-        image_info = server.get("image", {}) or {}
-        image_id = str(image_info.get("id", "")).strip()
-
-        # Resolve image name from image catalog
+        image_info = s.get("image", {})
+        image_id = image_info.get("id")
         image_name = image_map.get(image_id, "")
 
-        # Primary compliance rule: image name must be approved
-        compliant = is_golden_image(image_name)
-
-        # Fallback for your current test data only:
-        # If image name is missing but server is one of the Positive_* test VMs,
-        # mark it compliant. Remove this block in real production validation.
-        if not compliant and not image_name and server_name.lower().startswith("positive"):
-            compliant = True
-
-        status = "COMPLIANT" if compliant else "NON-COMPLIANT"
-
-        if compliant:
+        if is_approved_golden_image(image_name):
+            status_text = "COMPLIANT"
             compliant_count += 1
         else:
+            status_text = "NON-COMPLIANT"
             non_compliant_count += 1
 
-        print(f"{server_name} | {server_id} | {image_id} | {image_name or 'NO_IMAGE_NAME_FOUND'} | {status}")
+        print(f"{server_name} | {server_id} | {image_id} | {image_name} | {status_text}")
 
-        server_list.append(
-            {
-                "server_name": server_name,
-                "server_id": server_id,
-                "image_id": image_id,
-                "image_name": image_name,
-                "status": status,
-            }
-        )
+        server_list.append({
+            "server_name": server_name,
+            "server_id": server_id,
+            "image_id": image_id,
+            "image_name": image_name,
+            "status": status_text
+        })
 
     output = {
         "summary": {
             "total_servers": total_servers,
             "compliant": compliant_count,
-            "non_compliant": non_compliant_count,
+            "non_compliant": non_compliant_count
         },
-        "servers": server_list,
+        "servers": server_list
     }
 
-    output_file = "golden_image_compliance.json"
-    with open(output_file, "w", encoding="utf-8") as f:
+    with open("golden_image_compliance.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=4)
 
-    print(f"\nJSON saved: {output_file}")
-
+    print("\nJSON saved: golden_image_compliance.json")
     print("\n===== SUMMARY =====")
-    print(f"Total Servers : {total_servers}")
-    print(f"Compliant     : {compliant_count}")
-    print(f"Non-Compliant : {non_compliant_count}")
-
+    print(f"Total Servers   : {total_servers}")
+    print(f"Compliant       : {compliant_count}")
+    print(f"Non-Compliant   : {non_compliant_count}")
 
 if __name__ == "__main__":
     check_compliance()
-
